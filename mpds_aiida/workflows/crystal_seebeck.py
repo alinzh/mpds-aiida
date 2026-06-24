@@ -19,6 +19,7 @@ class MPDSCrystalSeebeckWorkChain(WorkChain):
     CRYSTAL_EXIT_CODE_MAP = {
         410: 'INPUT_ERROR',
         412: 'ERROR_OPTIMIZATION_FAILED',
+        413: 'ERROR_SYMMOPS',
     }
 
     @classmethod
@@ -77,6 +78,7 @@ class MPDSCrystalSeebeckWorkChain(WorkChain):
         spec.exit_code(450, 'ERROR_CRYSTAL_FAILED', 'The crystal WorkChain did not finish OK')
         spec.exit_code(411, 'ERROR_INVALID_ENGINE', 'Non-existent code is given')
         spec.exit_code(412, 'ERROR_OPTIMIZATION_FAILED', 'Structure optimization failed')
+        spec.exit_code(413, 'ERROR_SYMMOPS', 'Symmetry operations do not form a group')
         spec.exit_code(451, 'ERROR_PROPERTIES_FAILED', 'The properties WorkChain did not finish OK')
 
     def run_crystal(self):
@@ -112,6 +114,11 @@ class MPDSCrystalSeebeckWorkChain(WorkChain):
 
     def check_crystal(self):
         crystal = self.ctx.crystal
+
+        if crystal.is_excepted:
+            self.report("Crystal step excepted (likely symmops error) → skipping properties")
+            self.ctx.ready_for_properties = False
+            return self.exit_codes.ERROR_SYMMOPS
 
         if crystal.is_finished_ok:
             self._expose_crystal_outputs(crystal)
