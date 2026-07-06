@@ -3,7 +3,7 @@ Cloud factory for the accurate materials data
 
 [![DOI](https://zenodo.org/badge/183018648.svg)](https://doi.org/10.5281/zenodo.7693214)
 
-using the MPDS data platform, AiiDA workflows, and CRYSTAL simulation engine.
+using the MPDS data platform, AiiDA workflows, and CRYSTAL and FLEUR simulation engines.
 
 ![MPDS](https://raw.githubusercontent.com/mpds-io/mpds-aiida/master/mpds.png "MPDS + AiiDA") ![AiiDA](https://raw.githubusercontent.com/mpds-io/mpds-aiida/master/aiida.png "AiiDA + MPDS")
 
@@ -14,20 +14,21 @@ using the MPDS data platform, AiiDA workflows, and CRYSTAL simulation engine.
 
 - get accurate encyclopedic, reference, and benchmarking scientific data
 - get vast systematic training data for machine learning
-- use the cheap commodity cloud environment (_not_ necessarily the HPC cluster)
+- use the cheap commodity cloud environment (_not_ the HPC cluster)
 - ensure provenance tracking and reproducibility of simulations with AiiDA
+- compare simulation methods (Gaussians via CRYSTAL vs. FLAPW via FLEUR)
 
 
 ## Installation
 
-The code in this repo requires the [aiida-crystal-dft](https://github.com/tilde-lab/aiida-crystal-dft), [yascheduler](https://github.com/tilde-lab/yascheduler), and [mpds-ml-labs](https://github.com/mpds-io/mpds-ml-labs) Python packages installed. In their turn, they depend on the [aiida](https://github.com/aiidateam/aiida-core), [mpds_client](https://github.com/mpds-io/mpds_client), and other Python packages.
+The code in this repo requires the [aiida-crystal-dft](https://github.com/tilde-lab/aiida-crystal-dft), [aiida-reoptimize](https://github.com/mpds-io/aiida-reoptimize) and [yascheduler](https://github.com/tilde-lab/yascheduler) Python packages installed. In their turn, they depend on the [aiida](https://github.com/aiidateam/aiida-core), [mpds_client](https://github.com/mpds-io/mpds_client), and other Python packages.
 
 Thus, installation is as follows (replace `pip` with `pip3` if needed and mind virtual env):
 
 ```shell
 pip install git+https://github.com/tilde-lab/aiida-crystal-dft
+pip install git+https://github.com/mpds-io/aiida-reoptimize
 pip install git+https://github.com/tilde-lab/yascheduler
-pip install git+https://github.com/mpds-io/mpds-ml-labs
 git clone https://github.com/mpds-io/mpds-aiida
 pip install mpds-aiida/
 ```
@@ -106,15 +107,16 @@ Note: this repo is subject to change and presents an ongoing work in progress.
 
 ## Licensing
 
-- This code: [MIT](https://en.wikipedia.org/wiki/MIT_License)
-- CRYSTAL engine: [commercial](https://www.crystal.unito.it)
+- This code: MIT license
+- CRYSTAL engine: [commercial](https://www.crystalsolutions.eu)
+- FLEUR engine: MIT license
 
 The resulting data are available at the [MPDS platform](https://mpds.io/search/ab%20initio%20calculations), according to the CC BY 4.0 license.
 
 
 ## Issues and troubleshooting
 
-Please, report any issues in the respective repositories: [aiida-crystal-dft](https://github.com/tilde-lab/aiida-crystal-dft), [yascheduler](https://github.com/tilde-lab/yascheduler), [mpds-ml-labs](https://github.com/mpds-io/mpds-ml-labs), [aiida](https://github.com/aiidateam/aiida-core), [mpds_client](https://github.com/mpds-io/mpds_client), _etc._
+Please, report any issues in the respective repositories: [aiida-crystal-dft](https://github.com/tilde-lab/aiida-crystal-dft), [yascheduler](https://github.com/tilde-lab/yascheduler), [aiida](https://github.com/aiidateam/aiida-core), [mpds_client](https://github.com/mpds-io/mpds_client), _etc._
 
 The Google Cloud machines need first to be prepared via the web-browser SSH console (note `sudo -i`). The file `/etc/ssh/sshd_config` should be changed to allow `root` user to log in.
 
