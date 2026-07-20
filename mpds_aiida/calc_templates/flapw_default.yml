@@ -14,9 +14,9 @@ default:
       comp:
         kmax: 3.0
       kpt:
-        div1: 6
-        div2: 6
-        div3: 6
+        div1: 4
+        div2: 4
+        div3: 4
     wf_parameters:
       fleur_runmax: 10
       itmax_per_run: 300
