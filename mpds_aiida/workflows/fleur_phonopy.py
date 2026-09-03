@@ -6,6 +6,7 @@ from aiida.orm import (
     Bool,
     Dict,
     Int,
+    KpointsData,
     RemoteData,
     Str,
     StructureData,
@@ -28,26 +29,22 @@ from ase.units import Bohr, Hartree
 HARTREE_PER_BOHR_TO_EV_PER_ANGSTROM = Hartree / Bohr  # 27.211386245988 / 0.529177210903
 
 
-def _halve_kpoint_mesh_xml(xml_content: str) -> str:
-    """Halve nx/ny/nz on the active (type="mesh") kPointList in an inp.xml
-    string, matching scripts/phonon/run_fleur_scf.py's tuningB_fast preset
-    (restart_kpoints_factor=2): on SCF non-convergence, retrying with a
-    coarser k-mesh from the existing charge density converges displacements
-    that plain Anderson mixing stalls on at the original mesh (verified: the
-    same stall, down to the last decimal, disappears after this halving).
-    Only nx/ny/nz are touched -- FLEUR recomputes the symmetry-reduced
-    kPointList's `count` itself; the manual script never touched it either.
+def _get_kpoint_mesh_dims(xml_content: str) -> tuple[int, int, int]:
+    """Read nx/ny/nz off the active (type="mesh") kPointList in an inp.xml
+    string. These are metadata only -- see retry_scf_with_halved_kmesh for
+    why they can't just be edited in place to change the actual mesh.
     """
     root = etree.fromstring(xml_content.encode("utf-8"))
     for e in root.iter():
         if not isinstance(e.tag, str):
             continue
         if e.tag.split("}")[-1] == "kPointList" and e.get("type") == "mesh":
-            for axis in ("nx", "ny", "nz"):
-                cur = int(float(e.get(axis, "1")))
-                e.attrib[axis] = str(max(1, cur // 2))
-            break
-    return etree.tostring(root, xml_declaration=True, encoding="UTF-8").decode("utf-8")
+            return (
+                int(float(e.get("nx", "1"))),
+                int(float(e.get("ny", "1"))),
+                int(float(e.get("nz", "1"))),
+            )
+    return (1, 1, 1)
 
 
 class FleurForcesWorkChain(WorkChain):
@@ -144,18 +141,29 @@ class FleurForcesWorkChain(WorkChain):
 
     def retry_scf_with_halved_kmesh(self):
         """
-        If the SCF did not converge, retry it once with the k-point mesh
-        halved, continuing from the existing charge density. Matches the
-        manual pipeline's tuningB_fast preset (restart_kpoints_factor=2),
-        which is what actually converges the displacements plain Anderson
-        mixing stalls on -- more iterations at the same mesh is not enough
-        (verified directly: the manual run hit the identical stalled
-        energy_diff at the original mesh, then converged within 10 more
-        iterations after halving nx/ny/nz).
-
-        Only one retry is attempted, same as the manual preset. If it still
+        If the SCF did not converge, retry it once with a genuinely coarser
+        k-point mesh (nx/ny/nz halved, rounded down), continuing from the
+        existing charge density. Only one retry is attempted. If it still
         doesn't converge, self.ctx.scf_wc is left as the retry's result and
         prepare_forces_input's is_finished_ok check reports the failure.
+
+        This mirrors scripts/phonon/run_fleur_scf.py's tuningB_fast preset
+        (restart_kpoints_factor=2), with one important correction: that
+        script -- and an earlier version of this method -- only edited the
+        nx/ny/nz *attributes* on the kPointList element. That is a no-op:
+        inp.xml's type="mesh" kPointList stores the actual, already
+        symmetry-reduced k-points as explicit <kPoint> children, and
+        nothing regenerates that list from nx/ny/nz -- neither FLEUR nor
+        aiida-fleur reads the attributes back to rebuild the list. Verified
+        directly on KNbO3_16803 (workchains 93975 -> 94126): a "halved"
+        retry using the attribute-only edit reproduced the parent SCF's
+        stalled charge density and energy_diff to 16 significant figures,
+        i.e. FLEUR ran on the exact same k-points twice and failed the same
+        way. This version instead builds a real KpointsData for the halved
+        mesh (unreduced Monkhorst-Pack grid; no symmetry reduction, but a
+        strictly coarser and different set of points) and writes it in via
+        FleurinpModifier.set_kpointsdata, which regenerates the actual
+        <kPoint> list and switches inp.xml to use it.
         """
         if self.ctx.scf_wc.is_finished_ok:
             return
@@ -166,14 +174,41 @@ class FleurForcesWorkChain(WorkChain):
         failed_wc = self.ctx.scf_wc
         self.report(
             f"SCF workchain <{failed_wc.pk}> did not converge "
-            f"(exit_status={failed_wc.exit_status}); retrying once with the "
-            f"k-point mesh halved, continuing from the existing charge density."
+            f"(exit_status={failed_wc.exit_status}); retrying once with a "
+            f"genuinely coarser k-point mesh, continuing from the existing "
+            f"charge density."
         )
 
         old_fleurinp = failed_wc.outputs.fleurinp
         remote_folder = failed_wc.outputs.last_calc.remote_folder
-        new_xml = _halve_kpoint_mesh_xml(old_fleurinp.get_content("inp.xml"))
-        new_fleurinp = convert_xml_to_FleurInpData(new_xml)
+
+        cur_nx, cur_ny, cur_nz = _get_kpoint_mesh_dims(
+            old_fleurinp.get_content("inp.xml")
+        )
+        nx, ny, nz = (max(1, d // 2) for d in (cur_nx, cur_ny, cur_nz))
+        self.report(
+            f"k-point mesh {[cur_nx, cur_ny, cur_nz]} -> {[nx, ny, nz]} "
+            f"({nx * ny * nz} unreduced points)"
+        )
+
+        raw_points = [
+            [i / nx, j / ny, k / nz]
+            for i in range(nx)
+            for j in range(ny)
+            for k in range(nz)
+        ]
+        weights = [1.0 / len(raw_points)] * len(raw_points)
+
+        kpoints = KpointsData()
+        kpoints.set_cell_from_structure(old_fleurinp.get_structuredata())
+        kpoints.set_kpoints(raw_points, cartesian=False, weights=weights)
+        kpoints.store()
+
+        mod = FleurinpModifier(old_fleurinp)
+        mod.set_kpointsdata(
+            kpoints, name="halved_retry", switch=True, kpoint_type="mesh"
+        )
+        new_fleurinp = mod.freeze()
 
         inputs = {
             "fleur": self.inputs.fleur,
