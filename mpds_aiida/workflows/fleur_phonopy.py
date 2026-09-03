@@ -1,4 +1,5 @@
 import numpy as np
+from lxml import etree
 from aiida.engine import ExitCode, ToContext, WorkChain
 from aiida.orm import (
     ArrayData,
@@ -24,9 +25,29 @@ from aiida_reoptimize.structure.magmoms_utils import (
 )
 from ase.units import Bohr, Hartree
 
-HARTREE_PER_BOHR_TO_EV_PER_ANGSTROM = (
-    Hartree / Bohr
-)  # 27.211386245988 / 0.529177210903
+HARTREE_PER_BOHR_TO_EV_PER_ANGSTROM = Hartree / Bohr  # 27.211386245988 / 0.529177210903
+
+
+def _halve_kpoint_mesh_xml(xml_content: str) -> str:
+    """Halve nx/ny/nz on the active (type="mesh") kPointList in an inp.xml
+    string, matching scripts/phonon/run_fleur_scf.py's tuningB_fast preset
+    (restart_kpoints_factor=2): on SCF non-convergence, retrying with a
+    coarser k-mesh from the existing charge density converges displacements
+    that plain Anderson mixing stalls on at the original mesh (verified: the
+    same stall, down to the last decimal, disappears after this halving).
+    Only nx/ny/nz are touched -- FLEUR recomputes the symmetry-reduced
+    kPointList's `count` itself; the manual script never touched it either.
+    """
+    root = etree.fromstring(xml_content.encode("utf-8"))
+    for e in root.iter():
+        if not isinstance(e.tag, str):
+            continue
+        if e.tag.split("}")[-1] == "kPointList" and e.get("type") == "mesh":
+            for axis in ("nx", "ny", "nz"):
+                cur = int(float(e.get(axis, "1")))
+                e.attrib[axis] = str(max(1, cur // 2))
+            break
+    return etree.tostring(root, xml_declaration=True, encoding="UTF-8").decode("utf-8")
 
 
 class FleurForcesWorkChain(WorkChain):
@@ -50,6 +71,12 @@ class FleurForcesWorkChain(WorkChain):
             "ERROR_FORCES_FILE_PROCESSING_FAILED",
             message="Failed to process the FORCES file. The file may be corrupted or not retrieved properly.",
         )
+        spec.exit_code(
+            402,
+            "ERROR_PARENT_SCF_FAILED",
+            message="The parent SCF calculation did not finish successfully; no charge "
+            "density available to continue from into the forces step.",
+        )
 
         spec.input("fleur", valid_type=Str, required=True)
         spec.input("inpgen", valid_type=Str, required=False)
@@ -61,19 +88,16 @@ class FleurForcesWorkChain(WorkChain):
             "settings",
             valid_type=Dict,
             required=False,
-            default=lambda: Dict(
-                dict={"additional_retrieve_list": ["FORCES"]}
-            ),
+            default=lambda: Dict(dict={"additional_retrieve_list": ["FORCES"]}),
         )
         spec.input("fleurinp", required=False)
         spec.input("remote_data", valid_type=RemoteData, required=False)
         spec.input("structure_label", valid_type=Str, required=False)
-        spec.input(
-            "f_level", valid_type=Int, required=False, default=lambda: Int(0)
-        )
+        spec.input("f_level", valid_type=Int, required=False, default=lambda: Int(0))
         spec.outline(
             cls.load_codes,
             cls.run_scf,
+            cls.retry_scf_with_halved_kmesh,
             cls.prepare_forces_input,
             cls.run_forces_calc,
             cls.parse_forces_file,
@@ -118,15 +142,64 @@ class FleurForcesWorkChain(WorkChain):
         future = self.submit(FleurScfWorkChain, **inputs)
         return ToContext(scf_wc=future)
 
+    def retry_scf_with_halved_kmesh(self):
+        """
+        If the SCF did not converge, retry it once with the k-point mesh
+        halved, continuing from the existing charge density. Matches the
+        manual pipeline's tuningB_fast preset (restart_kpoints_factor=2),
+        which is what actually converges the displacements plain Anderson
+        mixing stalls on -- more iterations at the same mesh is not enough
+        (verified directly: the manual run hit the identical stalled
+        energy_diff at the original mesh, then converged within 10 more
+        iterations after halving nx/ny/nz).
+
+        Only one retry is attempted, same as the manual preset. If it still
+        doesn't converge, self.ctx.scf_wc is left as the retry's result and
+        prepare_forces_input's is_finished_ok check reports the failure.
+        """
+        if self.ctx.scf_wc.is_finished_ok:
+            return
+        if self.ctx.get("scf_kmesh_retried"):
+            return
+        self.ctx.scf_kmesh_retried = True
+
+        failed_wc = self.ctx.scf_wc
+        self.report(
+            f"SCF workchain <{failed_wc.pk}> did not converge "
+            f"(exit_status={failed_wc.exit_status}); retrying once with the "
+            f"k-point mesh halved, continuing from the existing charge density."
+        )
+
+        old_fleurinp = failed_wc.outputs.fleurinp
+        remote_folder = failed_wc.outputs.last_calc.remote_folder
+        new_xml = _halve_kpoint_mesh_xml(old_fleurinp.get_content("inp.xml"))
+        new_fleurinp = convert_xml_to_FleurInpData(new_xml)
+
+        inputs = {
+            "fleur": self.inputs.fleur,
+            "fleurinp": new_fleurinp,
+            "remote_data": remote_folder,
+        }
+        for key in ("wf_parameters", "options", "settings"):
+            if key in self.inputs:
+                inputs[key] = self.inputs[key]
+
+        future = self.submit(FleurScfWorkChain, **inputs)
+        return ToContext(scf_wc=future)
+
     def prepare_forces_input(self):
         """
         Modify the input from SCF calculation: set l_f=True, f_level from inputs.
         """
         # Get FleurinpData from SCF workchain output
         scf_wc = self.ctx.scf_wc
-        fleurinp = (
-            scf_wc.outputs.fleurinp if "fleurinp" in scf_wc.outputs else None
-        )
+        if not scf_wc.is_finished_ok:
+            self.report(
+                f"Parent SCF workchain <{scf_wc.pk}> did not finish successfully "
+                f"(exit_status={scf_wc.exit_status}); cannot continue to forces step."
+            )
+            return self.exit_codes.ERROR_PARENT_SCF_FAILED
+        fleurinp = scf_wc.outputs.fleurinp if "fleurinp" in scf_wc.outputs else None
         if fleurinp is None:
             fleurinp = scf_wc.outputs.last_calc.fleurinp  # fallback
 
@@ -166,9 +239,7 @@ class FleurForcesWorkChain(WorkChain):
             label = "Fleur forces calculation"
             description = "Fleur run for forces after SCF"
             settings = (
-                self.inputs.settings.get_dict()
-                if "settings" in self.inputs
-                else None
+                self.inputs.settings.get_dict() if "settings" in self.inputs else None
             )
 
             inputs_builder = get_inputs_fleur(
@@ -182,47 +253,155 @@ class FleurForcesWorkChain(WorkChain):
 
     def parse_forces_file(self):
         """
-        Read and parse the FORCES file from the retrieved folder of the forces calculation.
-        Returns forces as a list of lists of floats in the output Dict.
-        If file processing fails, exits with a special code.
+        Read and parse forces from the retrieved folder of the forces calculation.
+
+        Tries the standalone FORCES file first (written by some FLEUR versions).
+        If FORCES is not present, falls back to parsing forces from out.xml
+        (totalForcesOnRepresentativeAtoms/forceTotal tags), expanding
+        representative-atom forces to all atoms using inp.xml atomGroup counts.
+
+        Returns forces as a list of [Fx, Fy, Fz] in Hartree/Bohr
+        (inspect_forces converts to eV/Angstrom downstream).
+        If processing fails, exits with code 401.
         """
         forces_calc = self.ctx.forces_calc
         structure_number = (
-            self.inputs.structure_label
-            if "structure_label" in self.inputs
-            else "1"
+            self.inputs.structure_label if "structure_label" in self.inputs else "1"
         )
         try:
-            with forces_calc.outputs.retrieved.open("FORCES", "r") as handle:
-                lines = handle.readlines()
+            retrieved = forces_calc.outputs.retrieved
+            retrieved_files = retrieved.list_object_names()
+
             forces = []
-            for line in lines:
-                parts = line.split()
-                # Expecting lines with 4 parts: 3 floats and a label "force"
-                # e.g.   -9.3614763067792050E-004   0.0000000000000000        0.0000000000000000      force
-                # standart for fleur FORCES output
-                if len(parts) == 4 and parts[-1] == "force":
-                    try:
-                        vec = [
-                            float(parts[0]),
-                            float(parts[1]),
-                            float(parts[2]),
-                        ]
-                        forces.append(vec)
-                    except ValueError as e:
-                        self.report(f"Could not parse force line: {line}")
-                        raise e
+
+            if "FORCES" in retrieved_files:
+                # --- Path 1: standalone FORCES file (original behaviour) ---
+                with retrieved.open("FORCES", "r") as handle:
+                    lines = handle.readlines()
+                for line in lines:
+                    parts = line.split()
+                    if len(parts) == 4 and parts[-1] == "force":
+                        try:
+                            forces.append(
+                                [float(parts[0]), float(parts[1]), float(parts[2])]
+                            )
+                        except ValueError:
+                            self.report(f"Could not parse force line: {line}")
+                            raise
+            elif "out.xml" in retrieved_files:
+                # --- Path 2: extract forces from out.xml (FLEUR 6.2) ---
+                from lxml import etree as _etree
+
+                xml_content = retrieved.get_object_content("out.xml")
+                if not xml_content:
+                    return ExitCode(401, "out.xml is empty or unreadable")
+
+                parser = _etree.XMLParser(recover=True, huge_tree=True)
+                root = _etree.fromstring(
+                    xml_content.encode("utf-8")
+                    if isinstance(xml_content, str)
+                    else xml_content,
+                    parser,
+                )
+                if root is None:
+                    return ExitCode(401, "Could not parse out.xml")
+
+                raw_forces = []
+                # Find all iterations and take forceTotal only from the LAST one
+                iterations = [
+                    e
+                    for e in root.iter()
+                    if isinstance(e.tag, str) and e.tag.split("}")[-1] == "iteration"
+                ]
+                if iterations:
+                    # Use only the last iteration's forceTotal
+                    last_iter = iterations[-1]
+                    for e in last_iter.iter():
+                        if not isinstance(e.tag, str):
+                            continue
+                        if e.tag.split("}")[-1] == "forceTotal":
+                            fx, fy, fz = e.get("F_x"), e.get("F_y"), e.get("F_z")
+                            if fx is not None and fy is not None and fz is not None:
+                                raw_forces.append([float(fx), float(fy), float(fz)])
                 else:
-                    continue
+                    # Fallback: no iteration tags, take all forceTotal
+                    for e in root.iter():
+                        if not isinstance(e.tag, str):
+                            continue
+                        if e.tag.split("}")[-1] == "forceTotal":
+                            fx, fy, fz = e.get("F_x"), e.get("F_y"), e.get("F_z")
+                            if fx is not None and fy is not None and fz is not None:
+                                raw_forces.append([float(fx), float(fy), float(fz)])
+
+                if not raw_forces:
+                    return ExitCode(
+                        401,
+                        "No forceTotal entries found in out.xml",
+                    )
+
+                # Expand representative-atom forces to all atoms using inp.xml
+                if "inp.xml" in retrieved_files:
+                    inp_content = retrieved.get_object_content("inp.xml")
+                    inp_root = _etree.fromstring(
+                        inp_content.encode("utf-8")
+                        if isinstance(inp_content, str)
+                        else inp_content,
+                        _etree.XMLParser(recover=True, huge_tree=True),
+                    )
+                    group_counts = []
+                    if inp_root is not None:
+                        for ag in inp_root.iter():
+                            if not isinstance(ag.tag, str):
+                                continue
+                            if ag.tag.split("}")[-1] == "atomGroup":
+                                n = sum(
+                                    1
+                                    for child in ag
+                                    if isinstance(child.tag, str)
+                                    and child.tag.split("}")[-1] in ("relPos", "absPos")
+                                )
+                                group_counts.append(max(1, n))
+
+                    if group_counts:
+                        forces = []
+                        for i, f in enumerate(raw_forces):
+                            n = group_counts[i] if i < len(group_counts) else 1
+                            for _ in range(n):
+                                forces.append(list(f))
+                        self.report(
+                            f"Expanded {len(raw_forces)} representative "
+                            f"forces to {len(forces)} atom forces "
+                            f"(group_counts={group_counts})"
+                        )
+                    else:
+                        forces = raw_forces
+                        self.report(
+                            "No atomGroup info in inp.xml, "
+                            "using forces as-is (no expansion)"
+                        )
+                else:
+                    forces = raw_forces
+                    self.report(
+                        "inp.xml not in retrieved, using forces as-is (no expansion)"
+                    )
+            else:
+                return ExitCode(
+                    401,
+                    "Neither FORCES nor out.xml found in retrieved files: "
+                    f"{retrieved_files}",
+                )
+
+            if not forces:
+                return ExitCode(401, "No forces parsed from FORCES or out.xml")
 
             forces_dict = {
                 f"forces_{structure_number if isinstance(structure_number, (int, str)) else structure_number.value}": forces
             }
             self.ctx.forces_content = forces_dict
+
         except Exception as e:
-            self.report(f"Error parsing FORCES file: {e}")
-            # Exit with a special code if file processing fails
-            return ExitCode(401, f"FORCES file processing failed: {e}")
+            self.report(f"Error parsing forces: {e}")
+            return ExitCode(401, f"Forces processing failed: {e}")
 
     def finalize(self):
         """
@@ -234,9 +413,7 @@ class FleurForcesWorkChain(WorkChain):
         )
         # Expose SCF outputs for convenience
         self.out_many(
-            self.exposed_outputs(
-                self.ctx.scf_wc, FleurScfWorkChain, namespace="scf"
-            )
+            self.exposed_outputs(self.ctx.scf_wc, FleurScfWorkChain, namespace="scf")
         )
 
 
@@ -289,7 +466,9 @@ class PhonopyFleurWorkChain(PhonopyWorkChain):
         Run FleurForcesWorkChain for pristine and each displaced supercell.
         """
         # Get pristine supercell and all displaced supercells
-        supercells_dict = self.ctx.preprocess_data.calcfunctions.get_supercells_with_displacements()
+        supercells_dict = (
+            self.ctx.preprocess_data.calcfunctions.get_supercells_with_displacements()
+        )
         futures = {}
         magmoms_mapper = (
             self.inputs["magmoms_mapper"].get_dict()
@@ -334,17 +513,18 @@ class PhonopyFleurWorkChain(PhonopyWorkChain):
             f"Sending FleurForcesWorkChain for supercells: {list(futures.keys())}"
         )
         # Store all futures in context for later inspection
-        return ToContext(**{
-            f"calc_forces_{number}": future
-            for number, future in futures.items()
-        })
+        return ToContext(
+            **{f"calc_forces_{number}": future for number, future in futures.items()}
+        )
 
     def inspect_forces(self):
         """
         Collect forces from each FleurForcesWorkChain and expose them as ArrayData in the output namespace.
         """
 
-        supercells_dict = self.ctx.preprocess_data.calcfunctions.get_supercells_with_displacements()
+        supercells_dict = (
+            self.ctx.preprocess_data.calcfunctions.get_supercells_with_displacements()
+        )
         # all_labels = ["pristine"] + list(supercells_dict.keys())
         all_labels = list(i.split("_")[-1] for i in supercells_dict.keys())
         self.report(f"all_labels: {all_labels}")
@@ -355,9 +535,7 @@ class PhonopyFleurWorkChain(PhonopyWorkChain):
             self.report(f"for {label} get forces_wc: {forces_wc}")
             if forces_wc is not None and "forces" in forces_wc.outputs:
                 forces_out_dict = forces_wc.outputs["forces"].get_dict()
-                self.report(
-                    f"forces_out_dict keys: {list(forces_out_dict.keys())}"
-                )
+                self.report(f"forces_out_dict keys: {list(forces_out_dict.keys())}")
                 key = f"forces_{label}"
                 if key in forces_out_dict:
                     forces = forces_out_dict[key]
@@ -369,9 +547,7 @@ class PhonopyFleurWorkChain(PhonopyWorkChain):
                     array.store()
                     forces_dict[key] = array
                 else:
-                    self.report(
-                        f"Key {key} not found in forces_out_dict for {label}"
-                    )
+                    self.report(f"Key {key} not found in forces_out_dict for {label}")
                     return ExitCode(402, f"FORCES data not found for {label}")
             else:
                 self.report(f"No forces data for {label}")
