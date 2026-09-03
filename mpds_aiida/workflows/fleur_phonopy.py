@@ -210,17 +210,24 @@ class FleurForcesWorkChain(WorkChain):
         )
         new_fleurinp = mod.freeze()
 
-        # The coarser mesh is not itself a magic fix -- verified on
-        # KNbO3_16803 that at the parent's iteration budget (fleur_runmax=4,
-        # itmax_per_run=10 -> 40 iterations) two displacements' retries
-        # still didn't cross the convergence threshold. But unlike the
-        # parent's genuine plateau (identical charge distance for all 4
-        # runs), the retry's charge distance was still descending steadily
-        # every iteration right up to run 40 (e.g. 0.62 -> 0.47 -> 0.46 ->
-        # 0.10 over the last 4). That's a budget problem, not a stall, so
-        # the retry gets a larger fleur_runmax. The coarser mesh also makes
-        # each run several times faster (fewer k-points to diagonalize per
-        # iteration), so the extra budget costs comparatively little.
+        # The coarser mesh alone is not enough -- verified directly on two
+        # non-converging KNbO3_16803 displacements that tripling
+        # fleur_runmax (giving up to 12 internal FLEUR restarts instead of
+        # 4) made no difference whatsoever: the retry landed on the exact
+        # same charge distance and energy_diff as the 4-run version, to
+        # every reported digit. That's because FleurScfWorkChain's internal
+        # restart-across-runs does NOT actually carry the evolving charge
+        # density forward -- every internal "run" (and, it turns out, this
+        # retry's own first run too, despite remote_data being given)
+        # starts from the same charge distance as a cold start (~31.7,
+        # matching the atomic-superposition guess). Only iterations
+        # WITHIN a single continuous FLEUR run reliably progress: e.g. the
+        # coarse-mesh single-run trajectory itself descended steadily
+        # (0.62 -> 0.47 -> 0.46 -> 0.10 over its last 4 iterations, out of
+        # only 10 total) and was nowhere near stalled when it hit the
+        # itmax_per_run cap. So instead of more (ineffective) restarts,
+        # this gives the retry one long continuous run: itmax_per_run
+        # tripled, fleur_runmax forced to 1.
         inputs = {
             "fleur": self.inputs.fleur,
             "fleurinp": new_fleurinp,
@@ -234,9 +241,10 @@ class FleurForcesWorkChain(WorkChain):
             if "wf_parameters" in self.inputs
             else {}
         )
-        retry_wf_parameters["fleur_runmax"] = (
-            retry_wf_parameters.get("fleur_runmax", 4) * 3
+        retry_wf_parameters["itmax_per_run"] = (
+            retry_wf_parameters.get("itmax_per_run", 10) * 3
         )
+        retry_wf_parameters["fleur_runmax"] = 1
         inputs["wf_parameters"] = Dict(dict=retry_wf_parameters)
 
         future = self.submit(FleurScfWorkChain, **inputs)
