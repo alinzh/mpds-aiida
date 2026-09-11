@@ -31,20 +31,27 @@ HARTREE_PER_BOHR_TO_EV_PER_ANGSTROM = Hartree / Bohr  # 27.211386245988 / 0.5291
 
 def _get_kpoint_mesh_dims(xml_content: str) -> tuple[int, int, int]:
     """Read nx/ny/nz off the active (type="mesh") kPointList in an inp.xml
-    string. These are metadata only -- see retry_scf_with_halved_kmesh for
+    string. These are metadata only -- see retry_scf_with_denser_kmesh for
     why they can't just be edited in place to change the actual mesh.
+
+    Raises ValueError if the kPointList tag or its nx/ny/nz attributes are
+    not found: a silent fallback to (1, 1, 1) would produce a Gamma-only
+    mesh without any warning, which has no physical justification.
     """
     root = etree.fromstring(xml_content.encode("utf-8"))
     for e in root.iter():
         if not isinstance(e.tag, str):
             continue
         if e.tag.split("}")[-1] == "kPointList" and e.get("type") == "mesh":
-            return (
-                int(float(e.get("nx", "1"))),
-                int(float(e.get("ny", "1"))),
-                int(float(e.get("nz", "1"))),
-            )
-    return (1, 1, 1)
+            nx = e.get("nx")
+            ny = e.get("ny")
+            nz = e.get("nz")
+            if nx is None or ny is None or nz is None:
+                raise ValueError(
+                    "kPointList type='mesh' found but missing nx/ny/nz attributes"
+                )
+            return int(float(nx)), int(float(ny)), int(float(nz))
+    raise ValueError("kPointList type='mesh' not found in inp.xml")
 
 
 class FleurForcesWorkChain(WorkChain):
@@ -94,7 +101,7 @@ class FleurForcesWorkChain(WorkChain):
         spec.outline(
             cls.load_codes,
             cls.run_scf,
-            cls.retry_scf_with_halved_kmesh,
+            cls.retry_scf_with_denser_kmesh,
             cls.prepare_forces_input,
             cls.run_forces_calc,
             cls.parse_forces_file,
@@ -139,32 +146,31 @@ class FleurForcesWorkChain(WorkChain):
         future = self.submit(FleurScfWorkChain, **inputs)
         return ToContext(scf_wc=future)
 
-    def retry_scf_with_halved_kmesh(self):
+    def retry_scf_with_denser_kmesh(self):
         """
-        If the SCF did not converge, retry it once with a genuinely coarser
-        k-point mesh (nx/ny/nz halved, rounded down), continuing from the
+        If the SCF did not converge, retry it once with a denser k-point
+        mesh (nx/ny/nz multiplied by 1.5, rounded up), continuing from the
         existing charge density. Only one retry is attempted. If it still
         doesn't converge, self.ctx.scf_wc is left as the retry's result and
         prepare_forces_input's is_finished_ok check reports the failure.
 
-        This mirrors scripts/phonon/run_fleur_scf.py's tuningB_fast preset
-        (restart_kpoints_factor=2), with one important correction: that
-        script -- and an earlier version of this method -- only edited the
-        nx/ny/nz *attributes* on the kPointList element. That is a no-op:
-        inp.xml's type="mesh" kPointList stores the actual, already
-        symmetry-reduced k-points as explicit <kPoint> children, and
-        nothing regenerates that list from nx/ny/nz -- neither FLEUR nor
-        aiida-fleur reads the attributes back to rebuild the list. Verified
-        directly on KNbO3_16803 (workchains 93975 -> 94126): a "halved"
-        retry using the attribute-only edit reproduced the parent SCF's
-        stalled charge density and energy_diff to 16 significant figures,
-        i.e. FLEUR ran on the exact same k-points twice and failed the same
-        way. This version instead builds a real KpointsData for the halved
-        mesh (unreduced Monkhorst-Pack grid; no symmetry reduction, but a
-        strictly coarser and different set of points) and writes it in via
-        FleurinpModifier.set_kpointsdata, which regenerates the actual
-        <kPoint> list and switches inp.xml to use it.
+        Increasing the k-point sampling is the standard approach for
+        improving SCF convergence (as done in CRYSTAL). The factor 1.5 is
+        a compromise between accuracy and cost: e.g. 2x6x4 -> 3x9x6.
+
+        An earlier version of this method only edited the nx/ny/nz
+        *attributes* on the kPointList element. That is a no-op: inp.xml's
+        type="mesh" kPointList stores the actual, already symmetry-reduced
+        k-points as explicit <kPoint> children, and nothing regenerates
+        that list from nx/ny/nz -- neither FLEUR nor aiida-fleur reads the
+        attributes back to rebuild the list. This version instead builds a
+        real KpointsData for the denser mesh (unreduced Monkhorst-Pack
+        grid; no symmetry reduction, but a strictly denser set of points)
+        and writes it in via FleurinpModifier.set_kpointsdata, which
+        regenerates the actual <kPoint> list and switches inp.xml to use it.
         """
+        import math
+
         if self.ctx.scf_wc.is_finished_ok:
             return
         if self.ctx.get("scf_kmesh_retried"):
@@ -175,7 +181,7 @@ class FleurForcesWorkChain(WorkChain):
         self.report(
             f"SCF workchain <{failed_wc.pk}> did not converge "
             f"(exit_status={failed_wc.exit_status}); retrying once with a "
-            f"genuinely coarser k-point mesh, continuing from the existing "
+            f"denser k-point mesh (x1.5), continuing from the existing "
             f"charge density."
         )
 
@@ -185,7 +191,7 @@ class FleurForcesWorkChain(WorkChain):
         cur_nx, cur_ny, cur_nz = _get_kpoint_mesh_dims(
             old_fleurinp.get_content("inp.xml")
         )
-        nx, ny, nz = (max(1, d // 2) for d in (cur_nx, cur_ny, cur_nz))
+        nx, ny, nz = (math.ceil(d * 1.5) for d in (cur_nx, cur_ny, cur_nz))
         self.report(
             f"k-point mesh {[cur_nx, cur_ny, cur_nz]} -> {[nx, ny, nz]} "
             f"({nx * ny * nz} unreduced points)"
@@ -206,28 +212,16 @@ class FleurForcesWorkChain(WorkChain):
 
         mod = FleurinpModifier(old_fleurinp)
         mod.set_kpointsdata(
-            kpoints, name="halved_retry", switch=True, kpoint_type="mesh"
+            kpoints, name="denser_retry", switch=True, kpoint_type="mesh"
         )
         new_fleurinp = mod.freeze()
 
-        # The coarser mesh alone is not enough -- verified directly on two
-        # non-converging KNbO3_16803 displacements that tripling
-        # fleur_runmax (giving up to 12 internal FLEUR restarts instead of
-        # 4) made no difference whatsoever: the retry landed on the exact
-        # same charge distance and energy_diff as the 4-run version, to
-        # every reported digit. That's because FleurScfWorkChain's internal
-        # restart-across-runs does NOT actually carry the evolving charge
-        # density forward -- every internal "run" (and, it turns out, this
-        # retry's own first run too, despite remote_data being given)
-        # starts from the same charge distance as a cold start (~31.7,
-        # matching the atomic-superposition guess). Only iterations
-        # WITHIN a single continuous FLEUR run reliably progress: e.g. the
-        # coarse-mesh single-run trajectory itself descended steadily
-        # (0.62 -> 0.47 -> 0.46 -> 0.10 over its last 4 iterations, out of
-        # only 10 total) and was nowhere near stalled when it hit the
-        # itmax_per_run cap. So instead of more (ineffective) restarts,
-        # this gives the retry one long continuous run: itmax_per_run
-        # tripled, fleur_runmax forced to 1.
+        # Give the retry one long continuous run: itmax_per_run tripled,
+        # fleur_runmax forced to 1. FleurScfWorkChain's internal
+        # restart-across-runs does not reliably carry the evolving charge
+        # density forward, so more restarts are ineffective. Only
+        # iterations within a single continuous FLEUR run reliably
+        # progress the charge distance.
         inputs = {
             "fleur": self.inputs.fleur,
             "fleurinp": new_fleurinp,
